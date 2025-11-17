@@ -1,0 +1,6 @@
+#pip install -r requirements.txt
+python-telegram-bot==20.4
+psycopg2-binary==2.9.7
+openpyxl==3.1.2
+qrcode[pil]==7.4.2
+Pillow==10.0.0
