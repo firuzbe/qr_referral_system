@@ -1,8 +1,8 @@
 import os
 
 # Настройки Telegram бота
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '7852718537:AAGTPfDPxBpxPD7drDQTI-FflH4CYHTnXcY')
-ADMIN_ID = 5321942267  # Ваш Telegram ID
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'yyy')
+ADMIN_ID = yyy  # Ваш Telegram ID
 
 # Настройки PostgreSQL
 DB_CONFIG = {
