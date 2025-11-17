@@ -10,7 +10,7 @@ DB_CONFIG = {
     'port': os.environ.get('DB_PORT', '5432'),
     'database': os.environ.get('DB_NAME', 'referral_bot'),
     'user': os.environ.get('DB_USER', 'postgres'),
-    'password': os.environ.get('DB_PASSWORD', 'mirzoev1217')
+    'password': os.environ.get('DB_PASSWORD', 'yyy')
 }
 
 # Настройки бонусов
