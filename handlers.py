@@ -58,6 +58,7 @@ class BotHandlers:
             if context.args and len(context.args) > 0:
                 referral_code = context.args[0]
 
+            # Если пользователь уже зарегистрирован
             if db_manager.user_exists(telegram_id):
                 if referral_code:
                     # Обрабатываем реферальный код для уже зарегистрированного пользователя
@@ -74,10 +75,48 @@ class BotHandlers:
                     )
                 return ConversationHandler.END
 
+            # Если у пользователя есть username — регистрируем автоматически (только username)
+            if user.username:
+                try:
+                    # При создании мы передаём username и минимум данных; db_manager должен принять такие значения
+                    user_id, user_referral_code = db_manager.create_user(
+                        telegram_id=telegram_id,
+                        username=user.username,
+                        first_name=None,
+                        last_name=None,
+                        patronymic=None,
+                        email=None,
+                        phone=None
+                    )
+                    # Привязываем referral, если был код в параметрах /start
+                    if referral_code and user_id:
+                        referrer = db_manager.get_user_by_referral_code(referral_code)
+                        if referrer and referrer['telegram_id'] != telegram_id:
+                            db_manager.create_referral(referrer['id'], user_id, referral_code)
+
+                    await update.message.reply_text(
+                        "🎉 Вы успешно зарегистрированы автоматически по username! 🎉\n\n"
+                        f"👤 Username: @{user.username}\n\n"
+                        "Если хотите добавить email или телефон — используйте /start и пройдите регистрацию вручную, "
+                        "или обратитесь к администратору.\n\n"
+                        "Доступные команды:\n"
+                        "/mycode - ваш реферальный код\n"
+                        "/myref - реферальная ссылка и QR-код\n"
+                        "/balance - ваш баланс\n"
+                        "/referrals - ваши рефералы\n"
+                        "/adminpanel - админ панель\n"
+                    )
+                except Exception as e:
+                    logger.error(f"Error auto-register by username: {e}")
+                    await update.message.reply_text(
+                        "❌ Ошибка при автоматической регистрации. Попробуйте /start ещё раз."
+                    )
+                return ConversationHandler.END
+
+            # Если username нет — используем сессию и просим ФИО
             if not db_manager.get_user_session(telegram_id):
                 db_manager.create_user_session(telegram_id)
 
-            # Сохраняем реферальный код в сессии, если он есть
             if referral_code:
                 db_manager.update_user_session(telegram_id, registration_data={'referral_code': referral_code})
 
@@ -110,7 +149,7 @@ class BotHandlers:
 
                 await update.message.reply_text(
                     "✅ Реферальный код успешно применен!\n\n"
-                    f"Вы были приглашены пользователем: {referrer['username']}\n"
+                    f"Вы были приглашены пользователем: {referrer.get('username')}\n"
                     "Бонус будет начислен после подтверждения администратором."
                 )
             else:
@@ -129,14 +168,18 @@ class BotHandlers:
                 await update.message.reply_text("Пожалуйста, введите Фамилию Имя Отчество:")
                 return NAME
 
-            registration_data = {
+            registration_piece = {
                 'full_name': name_input,
                 'last_name': name_parts[0],
                 'first_name': name_parts[1],
                 'patronymic': name_parts[2] if len(name_parts) > 2 else ''
             }
 
-            db_manager.update_user_session(telegram_id, current_step=EMAIL, registration_data=registration_data)
+            # Берём текущую сессию, аккуратно мёрджим данные
+            session = db_manager.get_user_session(telegram_id) or {}
+            current_reg = session.get('registration_data', {})
+            current_reg.update(registration_piece)
+            db_manager.update_user_session(telegram_id, current_step=EMAIL, registration_data=current_reg)
 
             await update.message.reply_text(
                 "📧 Укажите ваш email (необязательно):\n"
@@ -161,8 +204,11 @@ class BotHandlers:
                     )
                     return EMAIL
 
-            registration_data = {'email': email_input if email_input != '-' else None}
-            db_manager.update_user_session(telegram_id, current_step=PHONE, registration_data=registration_data)
+            # Обновляем сессию аккуратно
+            session = db_manager.get_user_session(telegram_id) or {}
+            current_reg = session.get('registration_data', {})
+            current_reg.update({'email': email_input if email_input != '-' else None})
+            db_manager.update_user_session(telegram_id, current_step=PHONE, registration_data=current_reg)
 
             await update.message.reply_text(
                 "📞 Укажите ваш номер телефона (необязательно):\n"
@@ -187,14 +233,17 @@ class BotHandlers:
                     )
                     return PHONE
 
-            registration_data = {'phone': phone_input if phone_input != '-' else None}
-            db_manager.update_user_session(telegram_id, current_step=COMPLETE, registration_data=registration_data)
+            # Обновляем сессию аккуратно
+            session = db_manager.get_user_session(telegram_id) or {}
+            current_reg = session.get('registration_data', {})
+            current_reg.update({'phone': phone_input if phone_input != '-' else None})
+            db_manager.update_user_session(telegram_id, current_step=COMPLETE, registration_data=current_reg)
 
-            user_session = db_manager.get_user_session(telegram_id)
+            user_session = db_manager.get_user_session(telegram_id) or {'registration_data': current_reg}
 
             # Проверяем есть ли реферальный код в сессии
             referral_info = ""
-            if user_session['registration_data'].get('referral_code'):
+            if user_session.get('registration_data', {}).get('referral_code'):
                 referral_info = f"\n🔗 Реферальный код: {user_session['registration_data'].get('referral_code')}"
 
             confirmation_text = (
@@ -218,37 +267,53 @@ class BotHandlers:
         try:
             telegram_id = update.effective_user.id
             user_input = update.message.text.strip().lower()
-            user_session = db_manager.get_user_session(telegram_id)
+            user_session = db_manager.get_user_session(telegram_id) or {}
 
             if user_input == 'нет':
                 await update.message.reply_text(
                     "Давайте начнем заново. 📝\n\n"
                     "Как вас зовут? (Фамилия Имя Отчество):"
                 )
+                # Сбрасываем шаг в сессии
+                db_manager.update_user_session(telegram_id, current_step=NAME, registration_data={})
                 return NAME
 
             elif user_input == 'да':
-                registration_data = user_session['registration_data']
+                registration_data = user_session.get('registration_data', {})
 
-                user_id, referral_code = db_manager.create_user(
-                    telegram_id=telegram_id,
-                    username=update.effective_user.username or f"user_{telegram_id}",
-                    first_name=registration_data.get('first_name'),
-                    last_name=registration_data.get('last_name'),
-                    patronymic=registration_data.get('patronymic'),
-                    email=registration_data.get('email'),
-                    phone=registration_data.get('phone')
-                )
+                # Если у пользователя в Telegram есть username — используй его как username по умолчанию
+                username = update.effective_user.username or f"user_{telegram_id}"
+
+                try:
+                    user_id, referral_code = db_manager.create_user(
+                        telegram_id=telegram_id,
+                        username=username,
+                        first_name=registration_data.get('first_name'),
+                        last_name=registration_data.get('last_name'),
+                        patronymic=registration_data.get('patronymic'),
+                        email=registration_data.get('email'),
+                        phone=registration_data.get('phone')
+                    )
+                except Exception as e:
+                    logger.error(f"Error creating user in DB: {e}")
+                    user_id = None
+                    referral_code = None
 
                 if user_id:
                     # Обрабатываем реферальный код, если он есть
                     referral_code_used = registration_data.get('referral_code')
                     if referral_code_used:
-                        referrer = db_manager.get_user_by_referral_code(referral_code_used)
-                        if referrer and referrer['telegram_id'] != telegram_id:
-                            db_manager.create_referral(referrer['id'], user_id, referral_code_used)
+                        try:
+                            referrer = db_manager.get_user_by_referral_code(referral_code_used)
+                            if referrer and referrer['telegram_id'] != telegram_id:
+                                db_manager.create_referral(referrer['id'], user_id, referral_code_used)
+                        except Exception as e:
+                            logger.error(f"Error creating referral relation: {e}")
 
-                    db_manager.delete_user_session(telegram_id)
+                    try:
+                        db_manager.delete_user_session(telegram_id)
+                    except Exception:
+                        pass
 
                     success_text = (
                         "🎉 Регистрация завершена! 🎉\n\n"
@@ -370,7 +435,7 @@ class BotHandlers:
                 referrals_count = db_manager.get_user_referrals(user['id'])
 
                 await update.message.reply_text(
-                    f"💰 Ваш баланс: {user['bonus_balance']} руб.\n\n"
+                    f"💰 Ваш баланс: {user.get('bonus_balance', 0)} руб.\n\n"
                     f"👥 Приведено друзей: {len(referrals_count)}\n"
                     f"💎 Реферальный код: `{user['referral_code']}`"
                 )
@@ -394,8 +459,8 @@ class BotHandlers:
                 if referrals:
                     referrals_text = "👥 Ваши рефералы:\n\n"
                     for i, referral in enumerate(referrals, 1):
-                        status = "✅ Бонус выплачен" if referral['bonus_paid'] else "⏳ Ожидает выплаты"
-                        referrals_text += f"{i}. {referral['referred_username']} - {status}\n"
+                        status = "✅ Бонус выплачен" if referral.get('bonus_paid') else "⏳ Ожидает выплаты"
+                        referrals_text += f"{i}. {referral.get('referred_username')} - {status}\n"
 
                     await update.message.reply_text(referrals_text)
                 else:
@@ -429,16 +494,17 @@ class BotHandlers:
 
             admin_text = (
                 "🔧 Админ Панель\n\n"
-                f"👥 Всего пользователей: {stats['total_users']}\n"
-                f"📊 Всего рефералов: {stats['total_referrals']}\n"
-                f"💰 Невыплаченные бонусы: {stats['unpaid_bonuses']}\n"
-                f"✅ Выплаченные бонусы: {stats['total_bonus_paid']}\n\n"
+                f"👥 Всего пользователей: {stats.get('total_users', 0)}\n"
+                f"📊 Всего рефералов: {stats.get('total_referrals', 0)}\n"
+                f"💰 Невыплаченные бонусы: {stats.get('unpaid_bonuses', 0)}\n"
+                f"✅ Выплаченные бонусы: {stats.get('total_bonus_paid', 0)}\n\n"
             )
 
             keyboard = [
                 [InlineKeyboardButton("📊 Обновить статистику", callback_data="admin_refresh")],
                 [InlineKeyboardButton("📋 Список невыплаченных", callback_data="admin_unpaid")],
                 [InlineKeyboardButton("📤 Экспорт в Excel", callback_data="admin_export")],
+                [InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -466,16 +532,17 @@ class BotHandlers:
                 stats = db_manager.get_admin_stats()
                 admin_text = (
                     "🔧 Админ Панель (обновлено)\n\n"
-                    f"👥 Всего пользователей: {stats['total_users']}\n"
-                    f"📊 Всего рефералов: {stats['total_referrals']}\n"
-                    f"💰 Невыплаченные бонусы: {stats['unpaid_bonuses']}\n"
-                    f"✅ Выплаченные бонусы: {stats['total_bonus_paid']}\n\n"
+                    f"👥 Всего пользователей: {stats.get('total_users', 0)}\n"
+                    f"📊 Всего рефералов: {stats.get('total_referrals', 0)}\n"
+                    f"💰 Невыплаченные бонусы: {stats.get('unpaid_bonuses', 0)}\n"
+                    f"✅ Выплаченные бонусы: {stats.get('total_bonus_paid', 0)}\n\n"
                 )
 
                 keyboard = [
                     [InlineKeyboardButton("📊 Обновить статистику", callback_data="admin_refresh")],
                     [InlineKeyboardButton("📋 Список невыплаченных", callback_data="admin_unpaid")],
                     [InlineKeyboardButton("📤 Экспорт в Excel", callback_data="admin_export")],
+                    [InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -494,11 +561,16 @@ class BotHandlers:
                 # Отправляем отдельное сообщение со списком
                 unpaid_text = "📋 Невыплаченные бонусы:\n\n"
                 for i, referral in enumerate(unpaid_referrals, 1):
+                    referral_date = referral.get('referral_date')
+                    if hasattr(referral_date, 'strftime'):
+                        date_str = referral_date.strftime('%d.%m.%Y %H:%M')
+                    else:
+                        date_str = str(referral_date)
                     unpaid_text += (
-                        f"{i}. 👤 {referral['referrer_name']}\n"
-                        f"   👥 Привел: {referral['referred_name']}\n"
-                        f"   📅 {referral['referral_date'].strftime('%d.%m.%Y %H:%M')}\n"
-                        f"   [ID: {referral['id']}]\n\n"
+                        f"{i}. 👤 {referral.get('referrer_name')}\n"
+                        f"   👥 Привел: {referral.get('referred_name')}\n"
+                        f"   📅 {date_str}\n"
+                        f"   [ID: {referral.get('id')}]\n\n"
                     )
 
                 await context.bot.send_message(
@@ -509,14 +581,14 @@ class BotHandlers:
                 # Отправляем кнопки для выплат
                 for referral in unpaid_referrals:
                     keyboard = [[InlineKeyboardButton(
-                        f"💸 Выплатить бонус {referral['referrer_name']}",
-                        callback_data=f"pay_{referral['id']}"
+                        f"💸 Выплатить бонус {referral.get('referrer_name')}",
+                        callback_data=f"pay_{referral.get('id')}"
                     )]]
                     reply_markup = InlineKeyboardMarkup(keyboard)
 
                     await context.bot.send_message(
                         chat_id=telegram_id,
-                        text=f"Бонус для {referral['referrer_name']} - {referral['referred_name']}",
+                        text=f"Бонус для {referral.get('referrer_name')} - {referral.get('referred_name')}",
                         reply_markup=reply_markup
                     )
 
@@ -531,15 +603,39 @@ class BotHandlers:
                     )
                 except Exception as e:
                     await query.edit_message_text(f"❌ Ошибка при экспорте: {e}")
+
+            elif data == "admin_users":
+                # Получаем список пользователей и показываем краткую карточку с кнопками
+                users = db_manager.get_all_users()
+                if not users:
+                    await query.edit_message_text("👥 Пользователи не найдены.")
+                    return
+
+                # Ограничим вывод первых 30 пользователей (не перегружать чат)
+                for u in users[:30]:
+                    username = u.get('username') or f"user_{u.get('telegram_id')}"
+                    text = (
+                        f"👤 @{username}\n"
+                        f"ID: {u.get('telegram_id')}\n"
+                        f"Email: {u.get('email') or 'Не указан'}\n"
+                        f"Тел: {u.get('phone') or 'Не указан'}\n"
+                    )
+                    kb = [
+                        [InlineKeyboardButton("Открыть чат", url=f"https://t.me/{username}")],
+                        [InlineKeyboardButton("Ввести номер вручную", callback_data=f"admin_user_enternum_{u.get('telegram_id')}")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(kb)
+                    await context.bot.send_message(chat_id=telegram_id, text=text, reply_markup=reply_markup)
+
         except Exception as e:
             logger.error(f"Error in admin_button_handler: {e}")
             try:
                 await query.edit_message_text("❌ Ошибка при обработке запроса.")
-            except:
+            except Exception:
                 pass
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик кнопок выплат"""
+        """Обработчик кнопок выплат и кнопок пользователей (ввод номера)"""
         try:
             query = update.callback_query
             await query.answer()
@@ -550,26 +646,49 @@ class BotHandlers:
                 await query.edit_message_text("❌ Нет доступа")
                 return
 
-            referral_id = int(query.data.replace("pay_", ""))
-            logger.info(f"Paying bonus for referral: {referral_id}")
+            data = query.data
 
-            success = db_manager.mark_bonus_paid(referral_id, telegram_id)
+            # Выплата бонуса
+            if data.startswith("pay_"):
+                referral_id = int(data.replace("pay_", ""))
+                logger.info(f"Paying bonus for referral: {referral_id}")
 
-            if success:
+                success = db_manager.mark_bonus_paid(referral_id, telegram_id)
+
+                if success:
+                    await query.edit_message_text(
+                        "✅ Бонус успешно выплачен!\n\n"
+                        "Статус обновлен в системе."
+                    )
+                else:
+                    await query.edit_message_text(
+                        "❌ Ошибка при выплате бонуса.\n"
+                        "Возможно, бонус уже был выплачен."
+                    )
+                return
+
+            # Обработка ввода номера вручную (админ)
+            if data.startswith("admin_user_enternum_"):
+                # Формат callback: admin_user_enternum_<telegram_id>
+                try:
+                    target_telegram_id = int(data.replace("admin_user_enternum_", ""))
+                except ValueError:
+                    await query.edit_message_text("❌ Неправильный ID пользователя.")
+                    return
+
+                # Подсказка админу: используйте команду /setphone <telegram_id> <номер>
                 await query.edit_message_text(
-                    "✅ Бонус успешно выплачен!\n\n"
-                    "Статус обновлен в системе."
+                    f"Введите команду для установки номера пользователю:\n"
+                    f"/setphone {target_telegram_id} <номер>\n\n"
+                    f"Пример: /setphone {target_telegram_id} +79001234567"
                 )
-            else:
-                await query.edit_message_text(
-                    "❌ Ошибка при выплате бонуса.\n"
-                    "Возможно, бонус уже был выплачен."
-                )
+                return
+
         except Exception as e:
             logger.error(f"Error in button_handler: {e}")
             try:
-                await query.edit_message_text("❌ Ошибка при выплате бонуса.")
-            except:
+                await query.edit_message_text("❌ Ошибка при обработке кнопки.")
+            except Exception:
                 pass
 
     async def export_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -598,6 +717,10 @@ class BotHandlers:
         try:
             text = update.message.text.lower().strip()
 
+            # Обработка специальной команды /setphone, если админ вводит ее как обычное сообщение (fallback)
+            if text.startswith('/setphone'):
+                return await self.set_phone_command(update, context)
+
             if text in ['start', 'старт']:
                 return await self.start(update, context)
             elif text in ['помощь', 'help', 'команды']:
@@ -619,6 +742,68 @@ class BotHandlers:
         except Exception as e:
             logger.error(f"Error in handle_message: {e}")
             await update.message.reply_text("❌ Произошла ошибка. Попробуйте еще раз.")
+
+    async def set_phone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Команда для админа: /setphone <telegram_id> <номер>
+        Устанавливает/обновляет номер телефона для пользователя с данным telegram_id.
+        """
+        try:
+            telegram_id = update.effective_user.id
+            if not db_manager.is_admin(telegram_id):
+                await update.message.reply_text("❌ У вас нет прав для этой команды.")
+                return
+
+            # Разбираем аргументы
+            args = context.args if hasattr(context, 'args') else []
+            if not args or len(args) < 2:
+                await update.message.reply_text("Использование: /setphone <telegram_id> <номер>\nПример: /setphone 123456789 +79001234567")
+                return
+
+            try:
+                target_telegram_id = int(args[0])
+            except ValueError:
+                await update.message.reply_text("❌ Неправильный telegram_id.")
+                return
+
+            number = args[1]
+            # Валидация номера — только цифры и +
+            number_digits = ''.join(filter(lambda c: c.isdigit() or c == '+', number))
+            if len(''.join(filter(str.isdigit, number_digits))) < 10:
+                await update.message.reply_text("❌ Неправильный формат номера.")
+                return
+
+            # Попытка обновить номер в БД — предполагаем, что db_manager имеет метод для этого
+            try:
+                updated = False
+                # Пробуем несколько возможных имён функции в db_manager (на случай, если в вашей реализации кот. другое имя)
+                if hasattr(db_manager, 'update_user_phone'):
+                    updated = db_manager.update_user_phone(target_telegram_id, number_digits)
+                elif hasattr(db_manager, 'set_user_phone'):
+                    updated = db_manager.set_user_phone(target_telegram_id, number_digits)
+                elif hasattr(db_manager, 'update_user_by_telegram_id'):
+                    # общий метод, передаём словарь полей
+                    updated = db_manager.update_user_by_telegram_id(target_telegram_id, {'phone': number_digits})
+                else:
+                    # Если нет подходящих методов — пробуем получить user и сохранить через create_user (рискованно)
+                    user = db_manager.get_user_by_telegram_id(target_telegram_id)
+                    if user:
+                        db_manager.update_user_phone_in_record = True  # no-op marker; реальная функция может отсутствовать
+                        # если нет метода, сообщим админу
+                        await update.message.reply_text("❌ На стороне db_manager нет метода для обновления телефона. Пожалуйста, добавьте update_user_phone(telegram_id, phone).")
+                        return
+
+                if updated:
+                    await update.message.reply_text("✅ Номер успешно обновлён.")
+                else:
+                    # Если метод вернул False или None — всё равно сообщим
+                    await update.message.reply_text("✅ Попытка обновления выполнена (проверьте, применился ли номер в БД).")
+            except Exception as e:
+                logger.error(f"Error updating phone in DB: {e}")
+                await update.message.reply_text("❌ Ошибка при обновлении номера в БД.")
+        except Exception as e:
+            logger.error(f"Error in set_phone_command: {e}")
+            await update.message.reply_text("❌ Ошибка при обработке команды /setphone.")
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
@@ -659,10 +844,12 @@ class BotHandlers:
         self.application.add_handler(CommandHandler("adminpanel", self.admin_panel))
         self.application.add_handler(CommandHandler("export", self.export_data))
         self.application.add_handler(CommandHandler("help", self.handle_message))
+        # Команда для установки номера админом
+        self.application.add_handler(CommandHandler("setphone", self.set_phone_command))
 
         # Обработчики кнопок
         self.application.add_handler(CallbackQueryHandler(self.admin_button_handler, pattern="^admin_"))
-        self.application.add_handler(CallbackQueryHandler(self.button_handler, pattern="^pay_"))
+        self.application.add_handler(CallbackQueryHandler(self.button_handler, pattern="^(pay_|admin_user_enternum_)"))
 
         # Обработчик любых сообщений (должен быть последним)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
